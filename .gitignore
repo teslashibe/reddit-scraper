@@ -2,6 +2,8 @@
 *.test
 *.out
 *.prof
+*.jsonl
+/scrape
 /tmp/
 /vendor/
 .DS_Store
