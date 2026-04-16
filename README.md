@@ -14,7 +14,12 @@
 
 ## Why this exists
 
-Reddit limits every listing to ~1,000 posts. This package bypasses that by querying the same subreddit through **7 different sort/time strategies**, merging and deduplicating by post ID. Result: **2,000+ unique posts** spanning years of history from a single call — with full comment trees included.
+Reddit limits every listing to ~1,000 posts. This package bypasses that two ways:
+
+1. **Live Reddit, multi-sort merge** — queries the same subreddit through **12 different sort/time strategies**, dedupes by post ID. Yields **~2,000–5,000 unique posts** per sub. Always live, always authoritative.
+2. **Arctic Shift archive** (default) — queries the community-maintained Pushshift replacement for the full historical dump. Yields **tens of thousands of posts** going back to subreddit creation. Empirically: 67,144 posts for r/Peptides covering 12 years, ~10s per 1,000 posts.
+
+Both modes return the same `Post` struct with full comment trees fetched from live Reddit, so you can swap backends without changing downstream code.
 
 ---
 
@@ -92,6 +97,34 @@ scraper := redditscraper.New(&redditscraper.Options{
 }, nil)
 ```
 
+### Pick a backend (default: auto)
+
+```go
+// Force Arctic Shift archive — unlocks tens of thousands of posts
+scraper := redditscraper.New(&redditscraper.Options{
+    Source:    redditscraper.SourceArctic,
+    PostLimit: 10000,
+}, nil)
+
+// Force Reddit live listings only — no third-party dependency
+scraper := redditscraper.New(&redditscraper.Options{
+    Source: redditscraper.SourceReddit,
+}, nil)
+
+// Default: try Arctic Shift first, fall back to Reddit on error
+scraper := redditscraper.New(nil, nil)
+```
+
+### Filter by date range
+
+`OldestPost` is honoured by both backends (server-side filter on Arctic Shift, client-side on Reddit listings):
+
+```go
+scraper := redditscraper.New(&redditscraper.Options{
+    OldestPost: time.Now().AddDate(-1, 0, 0), // last year
+}, nil)
+```
+
 ### Track progress in real time
 
 ```go
@@ -151,37 +184,46 @@ scraper := redditscraper.New(&redditscraper.Options{
 
 | Option | Type | Default | Description |
 |:---|:---|:---|:---|
+| `Source` | `PostSource` | `SourceAuto` | `SourceAuto` (try Arctic Shift, fall back to Reddit), `SourceArctic`, or `SourceReddit` |
+| `OldestPost` | `time.Time` | `zero` (no cutoff) | Earliest post date to fetch — server-side filter on Arctic Shift |
 | `Token` | `string` | `""` | Reddit session cookie for authenticated requests |
 | `UserAgent` | `string` | Chrome UA | Custom User-Agent string |
 | `RequestTimeout` | `time.Duration` | `30s` | HTTP timeout per request |
-| `MinRequestGap` | `time.Duration` | `650ms` | Rate-limit pause between requests |
+| `MinRequestGap` | `time.Duration` | `650ms` | Rate-limit pause between Reddit requests |
+| `ArcticAPIBase` | `string` | `https://arctic-shift.photon-reddit.com` | Override Arctic Shift base URL |
+| `ArcticRequestGap` | `time.Duration` | `200ms` | Pause between Arctic Shift requests |
 | `PostLimit` | `int` | `0` (all) | Max posts to return |
 | `CommentDepth` | `int` | `500` | Max comment nesting depth |
 | `SkipComments` | `bool` | `false` | Skip comment fetching entirely |
+| `ProxyURLs` | `[]string` | `nil` | HTTP/SOCKS5 proxies to rotate through (Reddit-side only) |
 
 ---
 
 ## How it works
 
-Reddit caps each listing at ~1,000 results. Different sort orders surface different posts:
+### Arctic Shift backend (default, deepest reach)
+
+[Arctic Shift](https://arctic-shift.photon-reddit.com) is a community-maintained continuous archive of Reddit, replacing the dead Pushshift service. The scraper paginates it newest-first via cursor-based `before=<unix_ts>` queries at 100 posts/request. There's effectively no per-sub cap — for r/Peptides we pulled 67,144 posts going back to 2014. Comments are still fetched live from Reddit using the post IDs Arctic Shift returns.
+
+### Reddit live backend (fallback)
+
+Reddit caps each listing at ~1,000 results. Different sort/time combinations surface different posts:
 
 | Strategy | What it finds |
 |:---|:---|
 | `new` | Most recent ~1,000 posts |
-| `top/all` | Highest-voted posts of all time |
-| `top/year` | Top posts this year |
-| `top/month` | Top posts this month |
-| `controversial/all` | Most controversial ever |
-| `controversial/year` | Most controversial this year |
-| `hot` | Currently trending |
+| `top/all` `top/year` `top/month` `top/week` `top/day` | Highest-voted in each window |
+| `controversial/all` `controversial/year` `controversial/month` `controversial/week` | Most controversial in each window |
+| `hot`, `rising` | Currently trending |
 
-The scraper exhausts each strategy, merges by post ID, and returns the combined set sorted newest-first.
+12 strategies merge into ~2,000–5,000 unique posts depending on subreddit volume.
 
-**Built-in protections:**
+**Built-in protections (both backends):**
 - Respects `X-Ratelimit-*` headers and retries on 429s
 - Exponential backoff on consecutive errors
 - Stale-page detection skips strategies that stop finding new posts
 - Expands Reddit's collapsed "more comments" threads automatically
+- Auto-fallback from Arctic Shift to Reddit if the archive is unreachable
 
 ---
 
@@ -241,13 +283,41 @@ Full JSON output:
 
 ---
 
+## CLI
+
+```bash
+go install github.com/teslashibe/reddit-scraper/cmd/scrape@latest
+
+# Default: auto backend, posts + comments
+scrape -sub Peptides -out ./data
+
+# Tens of thousands of posts, metadata only (much faster)
+scrape -sub Peptides -source arctic -max 50000 -skip-comments -out ./data
+
+# Last year only, with proxies
+scrape -sub Fitness -since 2025-04-16 -proxies proxies.txt -out ./data
+
+# Force the live Reddit backend (no Arctic Shift dependency)
+scrape -sub Peptides -source reddit -out ./data
+```
+
+| Flag | Default | Description |
+|:---|:---|:---|
+| `-source` | `auto` | `auto`, `arctic`, or `reddit` |
+| `-since` | `""` | Date cutoff (YYYY-MM-DD) |
+| `-max` | `0` (all) | Cap on total posts |
+| `-skip-comments` | `false` | Posts-only mode |
+| `-gap` | `1000` | ms between Reddit requests |
+| `-proxies` | `""` | Proxy file or comma list |
+| `-token` | `""` | Reddit `token_v2` cookie |
+
 ## Testing
 
 ```bash
-# Quick smoke tests (hits live Reddit API)
+# Quick smoke tests (hits live Reddit + Arctic Shift APIs)
 go test -v -short ./...
 
-# Full deep-pagination test (~60s, fetches 2000+ posts)
+# Full deep-pagination test (~60s)
 go test -v -run TestMultiSort -timeout 120s
 
 # With authentication
