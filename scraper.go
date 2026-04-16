@@ -41,11 +41,22 @@ type Options struct {
 	// returning only post metadata. Significantly faster for large scrapes.
 	SkipComments bool
 
+	// MoreCommentsTimeout caps the time spent expanding Reddit's "more"
+	// comment tokens per post (default 60s). Hitting the budget returns a
+	// partial-comments warning, not an error — ScrapeAll and FetchSinglePost
+	// keep whatever comments were collected up to that point.
+	//
+	// Raise this for slow or heavily-proxied environments where each
+	// expansion round-trip can cost several hundred milliseconds.
+	MoreCommentsTimeout time.Duration
+
 	// ProxyURLs is a list of HTTP/SOCKS5 proxy URLs to rotate through.
 	// Each proxy gets its own rate-limit budget. Format: http://host:port,
 	// http://user:pass@host:port, or socks5://host:port.
 	ProxyURLs []string
 }
+
+const defaultMoreCommentsTimeout = 60 * time.Second
 
 // Scraper fetches posts and comments from a subreddit.
 type Scraper struct {
@@ -343,8 +354,18 @@ func (s *Scraper) FetchComments(subreddit, postID string) ([]Comment, string, er
 	moreIDs := s.collectMoreIDs(listings[1])
 	if len(moreIDs) > 0 {
 		additional, err := s.fetchMoreComments(subreddit, postID, moreIDs)
+		// Treat a partial expansion of "more" comments as a warning, not a
+		// hard error. Reddit routinely buries long-tail comment chains
+		// behind dozens of "more" tokens; a 20-60s time budget on a proxied
+		// pool will often exhaust before we've walked the tree. Failing the
+		// whole scrape over it is almost always the wrong call — we already
+		// have the top-level comments that drive 95% of analysis value.
+		// Mirror the tolerant behaviour FetchSinglePost has always had.
 		if err != nil {
-			return comments, selfText, fmt.Errorf("fetching 'more' comments: %w (got %d so far)", err, len(comments))
+			s.emit(Progress{
+				Phase:   "comments",
+				Message: fmt.Sprintf("r/%s post %s: partial 'more' comments: %v", subreddit, postID, err),
+			})
 		}
 		comments = append(comments, additional...)
 	}
@@ -685,7 +706,11 @@ func (s *Scraper) collectMoreIDs(listing redditListing) []string {
 func (s *Scraper) fetchMoreComments(subreddit, postID string, ids []string) ([]Comment, error) {
 	var comments []Comment
 	consecutiveErr := 0
-	deadline := time.Now().Add(20 * time.Second)
+	budget := s.opts.MoreCommentsTimeout
+	if budget <= 0 {
+		budget = defaultMoreCommentsTimeout
+	}
+	deadline := time.Now().Add(budget)
 
 	for _, commentID := range ids {
 		if time.Now().After(deadline) {
