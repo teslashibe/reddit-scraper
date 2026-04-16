@@ -22,7 +22,22 @@ func main() {
 	token := flag.String("token", "", "Reddit token_v2 cookie (for NSFW/gated subs)")
 	fresh := flag.Bool("fresh", false, "Ignore existing progress and start from scratch")
 	proxies := flag.String("proxies", "", "Comma-separated proxy URLs (http://host:port or socks5://host:port), or path to a file with one proxy per line")
+	source := flag.String("source", "", "Post discovery backend: '' (auto, default), 'arctic' (Arctic Shift archive — 10-30× more posts), or 'reddit' (live listing API only)")
+	since := flag.String("since", "", "Only fetch posts created on or after this date (YYYY-MM-DD). Server-side filter when source=arctic.")
+	maxPosts := flag.Int("max", 0, "Cap total posts collected (0 = unlimited)")
+	skipComments := flag.Bool("skip-comments", false, "Skip comment fetching (much faster for large historical scrapes)")
 	flag.Parse()
+
+	postSource, err := parsePostSource(*source)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	oldest, err := parseSince(*since)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	if *postURL != "" {
 		scrapeSinglePost(*postURL, *outDir, *gap, *token, *proxies)
@@ -55,6 +70,10 @@ func main() {
 
 	opts := &redditscraper.Options{
 		MinRequestGap: time.Duration(*gap) * time.Millisecond,
+		Source:        postSource,
+		OldestPost:    oldest,
+		PostLimit:     *maxPosts,
+		SkipComments:  *skipComments,
 	}
 	if *token != "" {
 		opts.Token = *token
@@ -63,6 +82,8 @@ func main() {
 		opts.ProxyURLs = parseProxies(*proxies)
 	}
 	scraper := redditscraper.New(opts, progress)
+	log.Printf("Source: %s | OldestPost: %s | MaxPosts: %d | SkipComments: %v",
+		describeSource(postSource), describeSince(oldest), *maxPosts, *skipComments)
 	if scraper.ProxyCount() > 1 {
 		log.Printf("Testing %d proxies...", scraper.ProxyCount()-1)
 		healthy, dead := scraper.HealthCheck(subreddit)
@@ -86,6 +107,32 @@ func main() {
 		}
 		log.Printf("Got %d unique posts. Saving manifest...", len(posts))
 		saveManifest(manifestFile, posts)
+	}
+
+	// Posts-only mode: skip Phase 2 entirely and emit just metadata.
+	// Useful for huge historical scrapes where comment fetching would
+	// take days. Each line is still a valid Post JSON with empty
+	// Comments — downstream consumers don't need to special-case it.
+	if *skipComments {
+		writeStart := time.Now()
+		f, err := os.Create(outFile)
+		if err != nil {
+			log.Fatalf("Open output file: %v", err)
+		}
+		defer f.Close()
+		enc := json.NewEncoder(f)
+		for i := range posts {
+			if err := enc.Encode(posts[i]); err != nil {
+				log.Fatalf("Write post %s: %v", posts[i].ID, err)
+			}
+		}
+		stat, _ := f.Stat()
+		log.Printf("━━━ Done (posts-only) — wrote in %s ━━━", time.Since(writeStart).Round(time.Millisecond))
+		log.Printf("Output: %s (%.1f MB)", outFile, float64(stat.Size())/1024/1024)
+		log.Printf("Total: %d posts (comments skipped)", len(posts))
+		os.Remove(manifestFile)
+		close(progress)
+		return
 	}
 
 	// Phase 2: Fetch comments, resuming past completed posts
@@ -318,6 +365,51 @@ func scrapeSinglePost(rawURL, outDir string, gap int, token, proxies string) {
 	log.Printf("━━━ Done ━━━")
 	log.Printf("Post: %q by u/%s (%d points, %d comments fetched)", post.Title, post.Author, post.Score, nc)
 	log.Printf("Output: %s (%.2f MB)", outFile, sizeMB)
+}
+
+func parsePostSource(value string) (redditscraper.PostSource, error) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "", "auto":
+		return redditscraper.SourceAuto, nil
+	case "reddit", "live":
+		return redditscraper.SourceReddit, nil
+	case "arctic", "arctic-shift", "archive":
+		return redditscraper.SourceArctic, nil
+	default:
+		return "", fmt.Errorf("invalid -source %q (expected auto|reddit|arctic)", value)
+	}
+}
+
+func parseSince(value string) (time.Time, error) {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return time.Time{}, nil
+	}
+	if t, err := time.Parse("2006-01-02", v); err == nil {
+		return t, nil
+	}
+	if t, err := time.Parse(time.RFC3339, v); err == nil {
+		return t, nil
+	}
+	return time.Time{}, fmt.Errorf("invalid -since %q (expected YYYY-MM-DD)", value)
+}
+
+func describeSource(s redditscraper.PostSource) string {
+	switch s {
+	case redditscraper.SourceArctic:
+		return "arctic-shift"
+	case redditscraper.SourceReddit:
+		return "reddit-listings"
+	default:
+		return "auto (arctic→reddit fallback)"
+	}
+}
+
+func describeSince(t time.Time) string {
+	if t.IsZero() {
+		return "(no cutoff)"
+	}
+	return t.Format("2006-01-02")
 }
 
 func toProxyURL(s string) string {

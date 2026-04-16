@@ -4,6 +4,7 @@
 *.prof
 *.jsonl
 /scrape
+/depth-test
 /tmp/
 /vendor/
 .DS_Store

@@ -4,11 +4,35 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+)
+
+func urlQueryEscape(s string) string { return url.QueryEscape(s) }
+
+// PostSource selects which backend FetchPosts uses for post discovery.
+type PostSource string
+
+const (
+	// SourceAuto (default) tries Arctic Shift first, falls back to
+	// Reddit's listing API on error. Best for "I want as many posts
+	// as possible" workflows.
+	SourceAuto PostSource = ""
+
+	// SourceReddit uses only Reddit's public listing API. Capped at
+	// ~2-5k posts per subreddit (the 1000-per-listing × multi-sort
+	// dedup ceiling) but always live and authoritative.
+	SourceReddit PostSource = "reddit"
+
+	// SourceArctic uses only the Arctic Shift archive (community
+	// Pushshift replacement at https://arctic-shift.photon-reddit.com).
+	// Unlocks tens of thousands of historical posts but depends on a
+	// third-party service and may lag the live site by hours.
+	SourceArctic PostSource = "arctic"
 )
 
 // Options configures the scraper behaviour. All fields are optional.
@@ -54,6 +78,27 @@ type Options struct {
 	// Each proxy gets its own rate-limit budget. Format: http://host:port,
 	// http://user:pass@host:port, or socks5://host:port.
 	ProxyURLs []string
+
+	// Source selects the post-discovery backend. Default ("") tries
+	// Arctic Shift first then falls back to Reddit. Comments are always
+	// fetched live from Reddit regardless of this setting.
+	Source PostSource
+
+	// OldestPost is a server-side date cutoff: only posts created on
+	// or after this timestamp are fetched. Zero value means no cutoff
+	// (fetch full available history up to PostLimit). Honoured by both
+	// the Arctic Shift and Reddit backends.
+	OldestPost time.Time
+
+	// ArcticAPIBase overrides the Arctic Shift base URL. Default is
+	// https://arctic-shift.photon-reddit.com. Useful for testing or
+	// pointing at a self-hosted mirror.
+	ArcticAPIBase string
+
+	// ArcticRequestGap is the minimum pause between Arctic Shift
+	// requests. Default 200ms. Arctic Shift has no published rate
+	// limit but we stay polite.
+	ArcticRequestGap time.Duration
 }
 
 const defaultMoreCommentsTimeout = 60 * time.Second
@@ -142,16 +187,59 @@ func (s *Scraper) FetchSubreddit(name string) (*Subreddit, error) {
 	}, nil
 }
 
-// FetchPosts collects posts from a subreddit using multiple sort orders
-// and time ranges to maximise historical coverage. Reddit limits each
-// listing to ~1000 results, but different sort/time combos surface
-// different posts — merging them gives far deeper reach.
+// FetchPosts collects posts from a subreddit. The backend used depends
+// on Options.Source:
+//
+//   - SourceAuto (default): tries Arctic Shift first (10-30× more
+//     historical data than Reddit's listing API), falls back to the
+//     Reddit multi-sort strategy on error.
+//   - SourceArctic: Arctic Shift only. Returns an error if Arctic
+//     Shift is unreachable.
+//   - SourceReddit: Reddit listing API only. Capped at ~2-5k posts
+//     per subreddit due to Reddit's 1000-per-listing server-side
+//     limit, but always live and authoritative.
+//
+// Posts are returned newest-first. Options.PostLimit and
+// Options.OldestPost both act as stop conditions.
 func (s *Scraper) FetchPosts(subreddit string) ([]Post, error) {
+	switch s.opts.Source {
+	case SourceArctic:
+		return s.fetchPostsArctic(subreddit)
+	case SourceReddit:
+		return s.fetchPostsReddit(subreddit)
+	default:
+		// auto: try Arctic Shift first, fall back to Reddit on hard error
+		posts, err := s.fetchPostsArctic(subreddit)
+		if err == nil && len(posts) > 0 {
+			return posts, nil
+		}
+		if err != nil {
+			s.emit(Progress{
+				Phase:   "posts",
+				Message: fmt.Sprintf("arctic-shift failed (%v), falling back to reddit listings", err),
+			})
+		} else {
+			s.emit(Progress{
+				Phase:   "posts",
+				Message: "arctic-shift returned no posts, falling back to reddit listings",
+			})
+		}
+		return s.fetchPostsReddit(subreddit)
+	}
+}
+
+// fetchPostsReddit is the legacy multi-sort strategy that walks
+// Reddit's public listing endpoints. Each individual sort caps at
+// ~1000 results server-side, so we merge several sort/time combos to
+// maximise unique-post reach. Adding a sort here is essentially free
+// — overlap with the others is dedup'd by the seen map.
+func (s *Scraper) fetchPostsReddit(subreddit string) ([]Post, error) {
 	seen := make(map[string]bool)
 	var allPosts []Post
 
 	type strategy struct{ sort, t string }
 	strategies := []strategy{
+		// Original 7 strategies — these alone got ~2-3k unique posts.
 		{"new", ""},
 		{"top", "all"},
 		{"top", "year"},
@@ -159,6 +247,14 @@ func (s *Scraper) FetchPosts(subreddit string) ([]Post, error) {
 		{"controversial", "all"},
 		{"controversial", "year"},
 		{"hot", ""},
+		// Phase B (added 2026-04): on big subs these contribute another
+		// ~1-2k unique posts that the originals miss. Free win — each
+		// extra sort costs at most ~10 paginated requests.
+		{"top", "week"},
+		{"top", "day"},
+		{"controversial", "month"},
+		{"controversial", "week"},
+		{"rising", ""},
 	}
 
 	for _, strat := range strategies {
@@ -185,6 +281,19 @@ func (s *Scraper) FetchPosts(subreddit string) ([]Post, error) {
 		}
 	}
 
+	// Drop posts older than the cutoff (server-side filtering on
+	// listing endpoints isn't supported, so we filter client-side).
+	if !s.opts.OldestPost.IsZero() {
+		cutoff := s.opts.OldestPost
+		filtered := make([]Post, 0, len(allPosts))
+		for _, p := range allPosts {
+			if !p.CreatedUTC.Before(cutoff) {
+				filtered = append(filtered, p)
+			}
+		}
+		allPosts = filtered
+	}
+
 	sort.Slice(allPosts, func(i, j int) bool {
 		return allPosts[i].CreatedUTC.After(allPosts[j].CreatedUTC)
 	})
@@ -194,6 +303,28 @@ func (s *Scraper) FetchPosts(subreddit string) ([]Post, error) {
 	}
 
 	return allPosts, nil
+}
+
+// FetchListingPages paginates a single sort/time listing endpoint,
+// adding only posts not already in the seen set. Stops early after
+// 3 consecutive pages with zero new posts to avoid wasting requests.
+// The seen map is mutated and can be shared across calls to de-dupe
+// across strategies.
+func (s *Scraper) FetchListingPages(subreddit, sortOrder, timeFilter string, seen map[string]bool) ([]Post, error) {
+	return s.fetchListingPages(subreddit, sortOrder, timeFilter, seen)
+}
+
+// FetchSearch paginates the subreddit's search endpoint. Reddit's
+// search index returns posts matching the query, capped at 1000
+// results per query. Combining queries (different keywords, flairs,
+// or time buckets) unlocks additional ~1000-post windows beyond
+// what the plain listing endpoints can surface.
+//
+// query can be a plain term, a phrase in quotes, or a Reddit search
+// operator like `flair:"X"`, `author:alice`, or `self:yes`.
+// timeFilter is one of "", "all", "year", "month", "week", "day", "hour".
+func (s *Scraper) FetchSearch(subreddit, query, timeFilter string, seen map[string]bool) ([]Post, error) {
+	return s.fetchSearchPages(subreddit, query, timeFilter, seen)
 }
 
 // fetchListingPages paginates a single sort/time listing endpoint,
@@ -253,6 +384,83 @@ func (s *Scraper) fetchListingPages(subreddit, sortOrder, timeFilter string, see
 			Phase:        "posts",
 			PostsFetched: len(seen),
 			Message:      fmt.Sprintf("fetched page (sort=%s, %d new, %d total unique)", sortOrder, newCount, len(seen)),
+		})
+
+		if s.opts.PostLimit > 0 && len(seen) >= s.opts.PostLimit {
+			break
+		}
+
+		after = listing.Data.After
+		if after == "" {
+			break
+		}
+	}
+
+	return posts, nil
+}
+
+// fetchSearchPages paginates the subreddit search endpoint. Each
+// distinct query gets its own ~1000-post window, so cycling through
+// queries (flair facets, keyword buckets, time windows) can multiply
+// the total coverage far beyond what plain listings allow.
+func (s *Scraper) fetchSearchPages(subreddit, query, timeFilter string, seen map[string]bool) ([]Post, error) {
+	if seen == nil {
+		seen = make(map[string]bool)
+	}
+	var posts []Post
+	after := ""
+	count := 0
+	staleRun := 0
+
+	for {
+		path := fmt.Sprintf("/r/%s/search.json?q=%s&restrict_sr=on&sort=new&limit=100&raw_json=1",
+			subreddit, urlQueryEscape(query))
+		if timeFilter != "" {
+			path += "&t=" + timeFilter
+		}
+		if after != "" {
+			path += "&after=" + after + "&count=" + strconv.Itoa(count)
+		}
+
+		var listing redditListing
+		if err := s.pool.getJSON(path, &listing); err != nil {
+			return posts, err
+		}
+
+		if len(listing.Data.Children) == 0 {
+			break
+		}
+
+		newCount := 0
+		for _, child := range listing.Data.Children {
+			if child.Kind != "t3" {
+				continue
+			}
+			p := parsePost(child.Data)
+			if p.ID == "" {
+				continue
+			}
+			count++
+			if !seen[p.ID] {
+				seen[p.ID] = true
+				posts = append(posts, p)
+				newCount++
+			}
+		}
+
+		if newCount == 0 {
+			staleRun++
+			if staleRun >= 3 {
+				break
+			}
+		} else {
+			staleRun = 0
+		}
+
+		s.emit(Progress{
+			Phase:        "posts",
+			PostsFetched: len(seen),
+			Message:      fmt.Sprintf("search %q: +%d (%d total unique)", query, newCount, len(seen)),
 		})
 
 		if s.opts.PostLimit > 0 && len(seen) >= s.opts.PostLimit {
