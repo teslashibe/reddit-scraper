@@ -40,11 +40,17 @@ type Options struct {
 	// SkipComments makes ScrapeAll skip comment fetching entirely,
 	// returning only post metadata. Significantly faster for large scrapes.
 	SkipComments bool
+
+	// ProxyURLs is a list of HTTP/SOCKS5 proxy URLs to rotate through.
+	// Each proxy gets its own rate-limit budget. Format: http://host:port,
+	// http://user:pass@host:port, or socks5://host:port.
+	ProxyURLs []string
 }
 
 // Scraper fetches posts and comments from a subreddit.
 type Scraper struct {
 	client   *client
+	pool     *clientPool
 	opts     Options
 	progress chan<- Progress
 }
@@ -58,11 +64,27 @@ func New(opts *Options, progress chan<- Progress) *Scraper {
 	if opts.CommentDepth == 0 {
 		opts.CommentDepth = 500
 	}
+
+	pool := newClientPool(opts)
+
 	return &Scraper{
-		client:   newClient(opts),
+		client:   pool.clients[0],
+		pool:     pool,
 		opts:     *opts,
 		progress: progress,
 	}
+}
+
+// ProxyCount returns the number of clients in the pool (including direct).
+func (s *Scraper) ProxyCount() int {
+	return s.pool.size()
+}
+
+// HealthCheck tests all proxied clients and disables dead ones.
+// Returns (healthy, dead) counts.
+func (s *Scraper) HealthCheck(subreddit string) (int, int) {
+	testPath := fmt.Sprintf("/r/%s/new.json?limit=1&raw_json=1", subreddit)
+	return s.pool.HealthCheck(testPath)
 }
 
 // IsAuthenticated returns whether the scraper has a valid session.
@@ -77,7 +99,7 @@ func (s *Scraper) FetchSubreddit(name string) (*Subreddit, error) {
 	var raw struct {
 		Data json.RawMessage `json:"data"`
 	}
-	if err := s.client.getJSON(path, &raw); err != nil {
+	if err := s.pool.getJSON(path, &raw); err != nil {
 		return nil, fmt.Errorf("fetching subreddit info: %w", err)
 	}
 
@@ -182,7 +204,7 @@ func (s *Scraper) fetchListingPages(subreddit, sortOrder, timeFilter string, see
 		}
 
 		var listing redditListing
-		if err := s.client.getJSON(path, &listing); err != nil {
+		if err := s.pool.getJSON(path, &listing); err != nil {
 			return posts, err
 		}
 
@@ -246,7 +268,7 @@ func (s *Scraper) FetchPostsScroll(subreddit string) ([]Post, error) {
 	nextPath := fmt.Sprintf("/svc/shreddit/community-more-posts/new/?t=&name=%s&feedLength=0", subreddit)
 
 	for nextPath != "" {
-		body, err := s.client.getHTML(nextPath)
+		body, err := s.pool.getHTML(nextPath)
 		if err != nil {
 			return posts, fmt.Errorf("scroll page %d: %w", page, err)
 		}
@@ -300,7 +322,7 @@ func (s *Scraper) FetchComments(subreddit, postID string) ([]Comment, string, er
 		subreddit, postID, s.opts.CommentDepth)
 
 	var listings []redditListing
-	if err := s.client.getJSON(path, &listings); err != nil {
+	if err := s.pool.getJSON(path, &listings); err != nil {
 		return nil, "", fmt.Errorf("fetching comments for %s: %w", postID, err)
 	}
 
@@ -330,11 +352,61 @@ func (s *Scraper) FetchComments(subreddit, postID string) ([]Comment, string, er
 	return comments, selfText, nil
 }
 
+// FetchSinglePost fetches a single post by ID including full metadata and the
+// complete comment tree. This is the method behind the -url CLI flag.
+func (s *Scraper) FetchSinglePost(subreddit, postID string) (*Post, error) {
+	path := fmt.Sprintf("/r/%s/comments/%s.json?limit=500&depth=%d&raw_json=1&sort=top&threaded=true",
+		subreddit, postID, s.opts.CommentDepth)
+
+	var listings []redditListing
+	if err := s.pool.getJSON(path, &listings); err != nil {
+		return nil, fmt.Errorf("fetching post %s: %w", postID, err)
+	}
+
+	if len(listings) < 1 || len(listings[0].Data.Children) == 0 {
+		return nil, fmt.Errorf("post %s not found", postID)
+	}
+
+	post := parsePost(listings[0].Data.Children[0].Data)
+
+	if len(listings) >= 2 {
+		post.Comments = s.parseCommentListing(listings[1])
+
+		moreIDs := s.collectMoreIDs(listings[1])
+		if len(moreIDs) > 0 {
+			additional, err := s.fetchMoreComments(subreddit, postID, moreIDs)
+			if err != nil {
+				s.emit(Progress{Phase: "comments", Message: fmt.Sprintf("partial 'more' comments: %v", err)})
+			}
+			post.Comments = append(post.Comments, additional...)
+		}
+	}
+
+	return &post, nil
+}
+
+// ParsePostURL extracts the subreddit name and post ID from a Reddit URL.
+// Accepts formats like:
+//
+//	https://www.reddit.com/r/whoop/comments/1sf4xjz/...
+//	reddit.com/r/whoop/comments/1sf4xjz/
+//	/r/whoop/comments/1sf4xjz
+func ParsePostURL(rawURL string) (subreddit, postID string, err error) {
+	re := regexp.MustCompile(`/r/([^/]+)/comments/([^/]+)`)
+	m := re.FindStringSubmatch(rawURL)
+	if len(m) < 3 {
+		return "", "", fmt.Errorf("could not parse Reddit post URL: %s", rawURL)
+	}
+	return m[1], m[2], nil
+}
+
 // ScrapeAll fetches subreddit info, all posts, and (optionally) all comments.
 // If Options.Token is set, it authenticates the session before scraping.
 func (s *Scraper) ScrapeAll(subredditName string) (*ScrapeResult, error) {
 	if s.opts.Token != "" && !s.client.IsAuthenticated() {
-		s.client.WithToken(s.opts.Token)
+		for _, c := range s.pool.clients {
+			c.WithToken(s.opts.Token)
+		}
 		s.emit(Progress{Phase: "auth", Message: "using provided session token"})
 	}
 
@@ -612,29 +684,31 @@ func (s *Scraper) collectMoreIDs(listing redditListing) []string {
 
 func (s *Scraper) fetchMoreComments(subreddit, postID string, ids []string) ([]Comment, error) {
 	var comments []Comment
+	consecutiveErr := 0
+	deadline := time.Now().Add(20 * time.Second)
 
-	batchSize := 20
-	for i := 0; i < len(ids); i += batchSize {
-		end := i + batchSize
-		if end > len(ids) {
-			end = len(ids)
+	for _, commentID := range ids {
+		if time.Now().After(deadline) {
+			return comments, fmt.Errorf("more-comments: time budget exceeded (%d/%d expanded)", len(comments), len(ids))
 		}
-		batch := ids[i:end]
 
-		for _, commentID := range batch {
-			path := fmt.Sprintf("/r/%s/comments/%s/_/%s.json?raw_json=1&depth=%d",
-				subreddit, postID, commentID, s.opts.CommentDepth)
+		path := fmt.Sprintf("/r/%s/comments/%s/_/%s.json?raw_json=1&depth=%d",
+			subreddit, postID, commentID, s.opts.CommentDepth)
 
-			var listings []redditListing
-			if err := s.client.getJSON(path, &listings); err != nil {
-				continue
+		var listings []redditListing
+		if err := s.pool.getJSON(path, &listings); err != nil {
+			consecutiveErr++
+			if consecutiveErr >= 3 {
+				return comments, fmt.Errorf("more-comments: %d consecutive errors", consecutiveErr)
 			}
-			if len(listings) >= 2 {
-				for _, child := range listings[1].Data.Children {
-					if child.Kind == "t1" {
-						c, _ := parseComment(child.Data)
-						comments = append(comments, c)
-					}
+			continue
+		}
+		consecutiveErr = 0
+		if len(listings) >= 2 {
+			for _, child := range listings[1].Data.Children {
+				if child.Kind == "t1" {
+					c, _ := parseComment(child.Data)
+					comments = append(comments, c)
 				}
 			}
 		}
