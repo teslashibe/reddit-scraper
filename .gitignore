@@ -8,3 +8,12 @@
 /vendor/
 .DS_Store
 .env
+
+# Local proxy pool exports (Webshare etc.) — contain credentials, must not ship.
+*proxies*.txt
+
+# Scrape output
+/data/
+/monitor.sh
+
+*.log
