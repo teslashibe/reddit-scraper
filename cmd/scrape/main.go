@@ -9,8 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	redditscraper "github.com/teslashibe/reddit-scraper"
@@ -84,6 +82,20 @@ func main() {
 	if *proxies != "" {
 		opts.ProxyURLs = parseProxies(*proxies)
 	}
+	// Resolve worker count up-front so we can pass it via Options.
+	// Pool size = direct client + proxies. Cap at 32 to avoid
+	// overwhelming the pool.
+	workerCount := *workers
+	if workerCount <= 0 {
+		workerCount = len(opts.ProxyURLs) + 1
+		if workerCount > 32 {
+			workerCount = 32
+		}
+		if workerCount < 1 {
+			workerCount = 1
+		}
+	}
+	opts.CommentWorkers = workerCount
 	scraper := redditscraper.New(opts, progress)
 	log.Printf("Source: %s | OldestPost: %s | MaxPosts: %d | SkipComments: %v",
 		describeSource(postSource), describeSince(oldest), *maxPosts, *skipComments)
@@ -169,94 +181,57 @@ func main() {
 	}
 
 	todo := len(remaining)
-
-	workerCount := *workers
-	if workerCount <= 0 {
-		// Auto: roughly one worker per healthy proxy, capped at 32 to
-		// avoid OS file-descriptor / goroutine pressure on huge pools.
-		// scraper.ProxyCount() includes the direct client, so subtract
-		// one to size against actual proxies.
-		workerCount = scraper.ProxyCount()
-		if workerCount > 32 {
-			workerCount = 32
-		}
-		if workerCount < 1 {
-			workerCount = 1
-		}
-	}
-	if workerCount > todo && todo > 0 {
-		workerCount = todo
-	}
 	log.Printf("Phase 2: %d to fetch, %d already done, %d total (workers=%d)", todo, skipped, len(posts), workerCount)
 
 	start := time.Now()
 
-	// Fan-out comment fetches across workerCount goroutines that share
-	// the proxy pool. Each goroutine writes to its own posts[idx]
-	// (unique index → no race) but file encoding + counter updates +
-	// progress logging are serialized via a single mutex so JSONL stays
-	// one-post-per-line atomic and resumable.
-	var (
-		fileMu        sync.Mutex
-		written       int64
-		errored       int64
-		totalComments int64
-	)
-
-	jobs := make(chan int, todo)
-	var wg sync.WaitGroup
-	for w := 0; w < workerCount; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for idx := range jobs {
-				postStart := time.Now()
-				comments, selfText, fetchErr := scraper.FetchComments(subreddit, posts[idx].ID)
-				if fetchErr != nil {
-					atomic.AddInt64(&errored, 1)
-				}
-				posts[idx].Comments = comments
-				if selfText != "" {
-					posts[idx].SelfText = selfText
-				}
-				nc := countAll(comments)
-				atomic.AddInt64(&totalComments, int64(nc))
-
-				fileMu.Lock()
-				if err := enc.Encode(posts[idx]); err != nil {
-					fileMu.Unlock()
-					log.Fatalf("Write post %s: %v", posts[idx].ID, err)
-				}
-				wIdx := atomic.AddInt64(&written, 1)
-				eIdx := atomic.LoadInt64(&errored)
-				fileMu.Unlock()
-
-				postDur := time.Since(postStart).Round(time.Millisecond)
-				elapsed := time.Since(start)
-				rate := float64(wIdx) / elapsed.Seconds()
-				left := int64(todo) - wIdx
-				eta := time.Duration(0)
-				if rate > 0 {
-					eta = time.Duration(float64(left)/rate) * time.Second
-				}
-				status := "ok"
-				if fetchErr != nil {
-					status = "ERR"
-				}
-				log.Printf("  #%d/%d  post=%s  comments=%d  %s  %s  [%.1f p/s · ETA %s · %d err]",
-					wIdx, todo, posts[idx].ID, nc, status, postDur, rate, eta.Round(time.Second), eIdx)
-			}
-		}()
-	}
+	// Stream comments through the scraper's worker pool. We feed it
+	// only the still-needed posts (already-completed IDs were filtered
+	// above), then write each completed post to JSONL as it arrives.
+	pending := make([]redditscraper.Post, 0, len(remaining))
 	for _, idx := range remaining {
-		jobs <- idx
+		// Backfill subreddit on the post since manifest stubs may have
+		// been written before that field existed in older versions.
+		if posts[idx].Subreddit == "" {
+			posts[idx].Subreddit = subreddit
+		}
+		pending = append(pending, posts[idx])
 	}
-	close(jobs)
-	wg.Wait()
 
-	writtenFinal := int(atomic.LoadInt64(&written))
-	erroredFinal := int(atomic.LoadInt64(&errored))
-	totalCommentsFinal := int(atomic.LoadInt64(&totalComments))
+	var (
+		written       int
+		errored       int
+		totalComments int
+	)
+	for r := range scraper.StreamComments(pending) {
+		nc := countAll(r.Post.Comments)
+		totalComments += nc
+		if r.Err != nil {
+			errored++
+		}
+		if err := enc.Encode(r.Post); err != nil {
+			log.Fatalf("Write post %s: %v", r.Post.ID, err)
+		}
+		written++
+
+		elapsed := time.Since(start)
+		rate := float64(written) / elapsed.Seconds()
+		left := todo - written
+		eta := time.Duration(0)
+		if rate > 0 {
+			eta = time.Duration(float64(left)/rate) * time.Second
+		}
+		status := "ok"
+		if r.Err != nil {
+			status = "ERR"
+		}
+		log.Printf("  #%d/%d  post=%s  comments=%d  %s  [%.1f p/s · ETA %s · %d err]",
+			written, todo, r.Post.ID, nc, status, rate, eta.Round(time.Second), errored)
+	}
+
+	writtenFinal := written
+	erroredFinal := errored
+	totalCommentsFinal := totalComments
 	close(progress)
 
 	stat, _ := f.Stat()

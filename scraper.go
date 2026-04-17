@@ -714,11 +714,75 @@ func (s *Scraper) fetchAllCommentsSequential(subreddit string, posts []Post) err
 }
 
 func (s *Scraper) fetchAllCommentsParallel(subreddit string, posts []Post, workers int) error {
+	// Reuse the streaming primitive: each result mutates posts[i] in
+	// place (posts is the same slice the channel goroutines see via
+	// index closure), so we just drain the channel for side effects.
+	// Backfill Subreddit on each post so StreamComments can route the
+	// API URL correctly even when the caller is the legacy ScrapeAll
+	// flow that only knows about a single sub.
+	for i := range posts {
+		if posts[i].Subreddit == "" {
+			posts[i].Subreddit = subreddit
+		}
+	}
+	for r := range s.streamCommentsInto(posts, workers, true) {
+		_ = r // mutation already happened in-place
+	}
+	return nil
+}
+
+// CommentResult is one fully-fetched post emitted by StreamComments.
+// On a per-post failure Err is set and Post.Comments may be empty
+// or partially populated. Always check Err before persisting.
+//
+// Index is the position of this post in the slice originally passed
+// to StreamComments — handy when callers need to mutate or persist
+// alongside auxiliary metadata indexed by position.
+type CommentResult struct {
+	Post  Post
+	Err   error
+	Index int
+}
+
+// StreamComments fetches comments for each post in parallel using
+// Options.CommentWorkers goroutines (default 1 = sequential), emitting
+// each completed post on the returned channel as soon as it's done.
+// The channel is closed when all posts have been processed.
+//
+// Each post's Subreddit field is used to route the comment API URL,
+// so callers can mix posts from multiple subreddits in one batch.
+//
+// Per-post errors are tolerated and surfaced via CommentResult.Err
+// rather than aborting the whole stream — this is the building block
+// for resumable scraping. Persist each CommentResult to disk as it
+// arrives, and on restart skip any IDs already present in the output
+// file.
+func (s *Scraper) StreamComments(posts []Post) <-chan CommentResult {
+	workers := s.opts.CommentWorkers
+	if workers < 1 {
+		workers = 1
+	}
+	return s.streamCommentsInto(posts, workers, false)
+}
+
+// streamCommentsInto is the shared worker-pool engine. When mutateInPlace
+// is true the goroutines also write Comments/SelfText back onto the
+// original posts slice (used by ScrapeAll for backwards-compatible
+// in-place semantics). Either way every result is also emitted on the
+// returned channel.
+func (s *Scraper) streamCommentsInto(posts []Post, workers int, mutateInPlace bool) <-chan CommentResult {
 	if workers > len(posts) {
 		workers = len(posts)
 	}
 	if workers < 1 {
-		return nil
+		workers = 1
+	}
+
+	out := make(chan CommentResult, 32)
+
+	if len(posts) == 0 {
+		close(out)
+		return out
 	}
 
 	jobs := make(chan int, len(posts))
@@ -730,21 +794,26 @@ func (s *Scraper) fetchAllCommentsParallel(subreddit string, posts []Post, worke
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				comments, selfText, err := s.FetchComments(subreddit, posts[i].ID)
-				if err != nil {
+				p := posts[i]
+				comments, selfText, err := s.FetchComments(p.Subreddit, p.ID)
+				if err == nil {
+					p.Comments = comments
+					if selfText != "" {
+						p.SelfText = selfText
+					}
+					if mutateInPlace {
+						posts[i].Comments = comments
+						if selfText != "" {
+							posts[i].SelfText = selfText
+						}
+					}
+				} else {
 					atomic.AddInt64(&failed, 1)
 					s.emit(Progress{
 						Phase:   "comments",
-						PostID:  posts[i].ID,
-						Message: fmt.Sprintf("post %s comments failed (continuing): %v", posts[i].ID, err),
+						PostID:  p.ID,
+						Message: fmt.Sprintf("post %s comments failed (continuing): %v", p.ID, err),
 					})
-				} else {
-					// Each goroutine writes to a unique slice index, so
-					// no mutex is needed around posts[i] mutation.
-					posts[i].Comments = comments
-					if selfText != "" {
-						posts[i].SelfText = selfText
-					}
 				}
 
 				done := atomic.AddInt64(&completed, 1)
@@ -753,21 +822,27 @@ func (s *Scraper) fetchAllCommentsParallel(subreddit string, posts []Post, worke
 					Phase:        "comments",
 					PostsFetched: int(done),
 					TotalPosts:   len(posts),
-					PostID:       posts[i].ID,
+					PostID:       p.ID,
 					Message: fmt.Sprintf(
 						"fetched comments for %d/%d posts (%d failures, %d workers)",
 						done, len(posts), fail, workers),
 				})
+
+				out <- CommentResult{Post: p, Err: err, Index: i}
 			}
 		}()
 	}
 
-	for i := range posts {
-		jobs <- i
-	}
-	close(jobs)
-	wg.Wait()
-	return nil
+	go func() {
+		for i := range posts {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+		close(out)
+	}()
+
+	return out
 }
 
 func (s *Scraper) emit(p Progress) {
