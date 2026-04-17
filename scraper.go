@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -99,6 +101,21 @@ type Options struct {
 	// requests. Default 200ms. Arctic Shift has no published rate
 	// limit but we stay polite.
 	ArcticRequestGap time.Duration
+
+	// CommentWorkers controls comment-fetch concurrency in ScrapeAll.
+	//
+	//   0 or 1 → sequential (current behaviour: a single per-post
+	//            error aborts the entire scrape)
+	//   N >= 2 → parallel via N goroutines sharing the proxy pool;
+	//            per-post errors are tolerated (logged via progress,
+	//            the post simply has empty Comments) so transient
+	//            failures don't kill huge scrapes
+	//
+	// Recommended: pass roughly one worker per healthy proxy in the
+	// pool. The pool's per-client rate-limit gap (MinRequestGap)
+	// naturally caps throughput per IP, so over-subscribing workers
+	// just means a small wait queue per proxy — not request flooding.
+	CommentWorkers int
 }
 
 const defaultMoreCommentsTimeout = 60 * time.Second
@@ -650,23 +667,8 @@ func (s *Scraper) ScrapeAll(subredditName string) (*ScrapeResult, error) {
 	}
 
 	if !s.opts.SkipComments {
-		for i := range posts {
-			s.emit(Progress{
-				Phase:        "comments",
-				PostsFetched: i + 1,
-				TotalPosts:   len(posts),
-				PostID:       posts[i].ID,
-				Message:      fmt.Sprintf("fetching comments for post %d/%d (%s)", i+1, len(posts), posts[i].ID),
-			})
-
-			comments, selfText, err := s.FetchComments(subredditName, posts[i].ID)
-			if err != nil {
-				return nil, fmt.Errorf("post %s: %w", posts[i].ID, err)
-			}
-			posts[i].Comments = comments
-			if selfText != "" {
-				posts[i].SelfText = selfText
-			}
+		if err := s.fetchAllComments(subredditName, posts); err != nil {
+			return nil, err
 		}
 	}
 
@@ -676,6 +678,96 @@ func (s *Scraper) ScrapeAll(subredditName string) (*ScrapeResult, error) {
 		ScrapedAt:  time.Now().UTC(),
 		TotalPosts: len(posts),
 	}, nil
+}
+
+// fetchAllComments populates posts[*].Comments either sequentially
+// (CommentWorkers <= 1, abort on first error) or in parallel
+// (CommentWorkers >= 2, tolerate per-post errors).
+func (s *Scraper) fetchAllComments(subreddit string, posts []Post) error {
+	workers := s.opts.CommentWorkers
+	if workers <= 1 {
+		return s.fetchAllCommentsSequential(subreddit, posts)
+	}
+	return s.fetchAllCommentsParallel(subreddit, posts, workers)
+}
+
+func (s *Scraper) fetchAllCommentsSequential(subreddit string, posts []Post) error {
+	for i := range posts {
+		s.emit(Progress{
+			Phase:        "comments",
+			PostsFetched: i + 1,
+			TotalPosts:   len(posts),
+			PostID:       posts[i].ID,
+			Message:      fmt.Sprintf("fetching comments for post %d/%d (%s)", i+1, len(posts), posts[i].ID),
+		})
+
+		comments, selfText, err := s.FetchComments(subreddit, posts[i].ID)
+		if err != nil {
+			return fmt.Errorf("post %s: %w", posts[i].ID, err)
+		}
+		posts[i].Comments = comments
+		if selfText != "" {
+			posts[i].SelfText = selfText
+		}
+	}
+	return nil
+}
+
+func (s *Scraper) fetchAllCommentsParallel(subreddit string, posts []Post, workers int) error {
+	if workers > len(posts) {
+		workers = len(posts)
+	}
+	if workers < 1 {
+		return nil
+	}
+
+	jobs := make(chan int, len(posts))
+	var wg sync.WaitGroup
+	var completed, failed int64
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				comments, selfText, err := s.FetchComments(subreddit, posts[i].ID)
+				if err != nil {
+					atomic.AddInt64(&failed, 1)
+					s.emit(Progress{
+						Phase:   "comments",
+						PostID:  posts[i].ID,
+						Message: fmt.Sprintf("post %s comments failed (continuing): %v", posts[i].ID, err),
+					})
+				} else {
+					// Each goroutine writes to a unique slice index, so
+					// no mutex is needed around posts[i] mutation.
+					posts[i].Comments = comments
+					if selfText != "" {
+						posts[i].SelfText = selfText
+					}
+				}
+
+				done := atomic.AddInt64(&completed, 1)
+				fail := atomic.LoadInt64(&failed)
+				s.emit(Progress{
+					Phase:        "comments",
+					PostsFetched: int(done),
+					TotalPosts:   len(posts),
+					PostID:       posts[i].ID,
+					Message: fmt.Sprintf(
+						"fetched comments for %d/%d posts (%d failures, %d workers)",
+						done, len(posts), fail, workers),
+				})
+			}
+		}()
+	}
+
+	for i := range posts {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return nil
 }
 
 func (s *Scraper) emit(p Progress) {
