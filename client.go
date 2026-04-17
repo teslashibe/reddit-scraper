@@ -154,38 +154,61 @@ func (p *clientPool) HealthCheck(testPath string) (healthy, dead int) {
 	return healthy, dead
 }
 
+// pick returns the next client to use via round-robin across all
+// non-dead, non-backed-off clients. When every remaining client is
+// inside its backoff window we fall back to the one whose backoff
+// expires soonest, so callers don't hard-fail just because the pool
+// is briefly cool-down-bound.
+//
+// Round-robin (rather than "pick max remaining budget") matters
+// because all fresh clients start with identical state, which used
+// to make the previous picker stampede every concurrent caller onto
+// a single client until its X-Ratelimit-Remaining finally diverged.
+// The worker pool would then re-stampede onto the next client. Real
+// round-robin spreads load on the very first call.
 func (p *clientPool) pick() *client {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if len(p.clients) == 1 {
+	n := len(p.clients)
+	if n == 1 {
 		return p.clients[0]
 	}
 
-	best := p.next
-	bestScore := -1000.0
 	now := time.Now()
-	for i, c := range p.clients {
+	start := p.next % n
+
+	var fallback *client
+	var fallbackUntil time.Time
+
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		c := p.clients[idx]
+
 		c.mu.Lock()
-		if c.dead {
-			c.mu.Unlock()
+		dead := c.dead
+		backoff := c.backoffUntil
+		c.mu.Unlock()
+
+		if dead {
 			continue
 		}
-		score := c.remaining
-		if c.consecutiveErr > 0 {
-			score -= float64(c.consecutiveErr) * 50
+		if !now.Before(backoff) {
+			p.next = (idx + 1) % n
+			return c
 		}
-		if now.Before(c.backoffUntil) {
-			score -= 200
-		}
-		c.mu.Unlock()
-		if score > bestScore {
-			bestScore = score
-			best = i
+		if fallback == nil || backoff.Before(fallbackUntil) {
+			fallback = c
+			fallbackUntil = backoff
 		}
 	}
-	p.next = (best + 1) % len(p.clients)
-	return p.clients[best]
+
+	if fallback != nil {
+		return fallback
+	}
+	// Everyone is dead — return the direct client (index 0) so the
+	// caller still gets a meaningful error path instead of nil.
+	return p.clients[0]
 }
 
 func (p *clientPool) poolRetries() int {
@@ -241,6 +264,40 @@ func (p *clientPool) getHTML(path string) ([]byte, error) {
 
 func (p *clientPool) size() int {
 	return len(p.clients)
+}
+
+// ClientStats is a point-in-time snapshot of one pool client's
+// rate-limit and health state. Returned by clientPool.Snapshot so
+// callers (and the periodic pool-state progress emitter) can see
+// whether load is actually being spread across the pool.
+type ClientStats struct {
+	Index          int
+	IsProxied      bool
+	Dead           bool
+	Remaining      float64
+	ConsecutiveErr int
+	BackoffUntil   time.Time
+	LastRequestAt  time.Time
+}
+
+// Snapshot returns per-client state without holding the pool lock
+// across reads. Useful for periodic debug logging in the consumer.
+func (p *clientPool) Snapshot() []ClientStats {
+	out := make([]ClientStats, len(p.clients))
+	for i, c := range p.clients {
+		c.mu.Lock()
+		out[i] = ClientStats{
+			Index:          i,
+			IsProxied:      c.isProxied,
+			Dead:           c.dead,
+			Remaining:      c.remaining,
+			ConsecutiveErr: c.consecutiveErr,
+			BackoffUntil:   c.backoffUntil,
+			LastRequestAt:  c.lastRequestAt,
+		}
+		c.mu.Unlock()
+	}
+	return out
 }
 
 func (c *client) do(req *http.Request) (*http.Response, error) {
@@ -348,26 +405,37 @@ func (c *client) getJSON(path string, v interface{}) error {
 	return nil
 }
 
+// waitForRateLimit reserves the next available request slot for this
+// client and sleeps until that slot opens. Critically, the per-client
+// mutex is released BEFORE sleeping so concurrent callers don't all
+// serialize behind one in-flight request — they each reserve their
+// own future slot and wait independently.
+//
+// This is the standard leaky-bucket reservation pattern. Without it,
+// a 32-worker pool sharing one hot client effectively collapses to
+// ~1 request per minRequestGap because every goroutine queues behind
+// the lock during its own Sleep call.
 func (c *client) waitForRateLimit() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	now := time.Now()
-
-	if now.Before(c.backoffUntil) {
-		time.Sleep(time.Until(c.backoffUntil))
+	nextSlot := c.lastRequestAt.Add(c.minRequestGap)
+	if now.After(nextSlot) {
+		nextSlot = now
+	}
+	if c.backoffUntil.After(nextSlot) {
+		nextSlot = c.backoffUntil
+	}
+	if c.remaining <= 2 && c.resetAt.After(nextSlot) {
+		nextSlot = c.resetAt.Add(time.Second)
 	}
 
-	if elapsed := now.Sub(c.lastRequestAt); elapsed < c.minRequestGap {
-		time.Sleep(c.minRequestGap - elapsed)
-	}
+	c.lastRequestAt = nextSlot
+	c.mu.Unlock()
 
-	if c.remaining <= 2 && time.Now().Before(c.resetAt) {
-		wait := time.Until(c.resetAt) + time.Second
+	if wait := time.Until(nextSlot); wait > 0 {
 		time.Sleep(wait)
 	}
-
-	c.lastRequestAt = time.Now()
 }
 
 func (c *client) updateRateLimits(h http.Header) {
