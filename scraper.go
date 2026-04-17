@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"math"
 	"net/url"
 	"regexp"
 	"sort"
@@ -789,6 +790,12 @@ func (s *Scraper) streamCommentsInto(posts []Post, workers int, mutateInPlace bo
 	var wg sync.WaitGroup
 	var completed, failed int64
 
+	// Periodic pool-state telemetry so operators can confirm load is
+	// actually spreading across the proxy pool. Runs until all workers
+	// exit. Cheap (one snapshot every 15s).
+	stopTelemetry := make(chan struct{})
+	go s.runPoolTelemetry(stopTelemetry, &completed, len(posts), workers)
+
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
@@ -839,10 +846,57 @@ func (s *Scraper) streamCommentsInto(posts []Post, workers int, mutateInPlace bo
 		}
 		close(jobs)
 		wg.Wait()
+		close(stopTelemetry)
 		close(out)
 	}()
 
 	return out
+}
+
+// runPoolTelemetry emits a periodic "phase=pool" Progress event with
+// a compact summary of per-client rate-limit state. Helps diagnose
+// whether the round-robin picker is actually spreading load (the
+// original symptom that motivated this telemetry was a single client
+// servicing all 32 workers while peers sat idle).
+func (s *Scraper) runPoolTelemetry(stop <-chan struct{}, completed *int64, totalPosts, workers int) {
+	if s.pool == nil || s.pool.size() <= 1 {
+		return
+	}
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			snap := s.pool.Snapshot()
+			alive := 0
+			var minRem, maxRem float64 = math.MaxFloat64, -1
+			for _, c := range snap {
+				if c.Dead {
+					continue
+				}
+				alive++
+				if c.Remaining < minRem {
+					minRem = c.Remaining
+				}
+				if c.Remaining > maxRem {
+					maxRem = c.Remaining
+				}
+			}
+			if alive == 0 {
+				continue
+			}
+			s.emit(Progress{
+				Phase:        "pool",
+				PostsFetched: int(atomic.LoadInt64(completed)),
+				TotalPosts:   totalPosts,
+				Message: fmt.Sprintf(
+					"pool: %d/%d clients alive, remaining=[%.0f..%.0f], workers=%d",
+					alive, len(snap), minRem, maxRem, workers),
+			})
+		}
+	}
 }
 
 func (s *Scraper) emit(p Progress) {
@@ -1078,41 +1132,101 @@ func (s *Scraper) collectMoreIDs(listing redditListing) []string {
 	return ids
 }
 
+// moreCommentsMaxWorkers caps in-post "more" expansion fan-out. The
+// limit exists because fetchMoreComments is called from inside a post
+// worker that's itself one of N comment workers — going higher just
+// starves the rest of the post pool for proxy/rate-limit slots.
+const moreCommentsMaxWorkers = 8
+
 func (s *Scraper) fetchMoreComments(subreddit, postID string, ids []string) ([]Comment, error) {
-	var comments []Comment
-	consecutiveErr := 0
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
 	budget := s.opts.MoreCommentsTimeout
 	if budget <= 0 {
 		budget = defaultMoreCommentsTimeout
 	}
 	deadline := time.Now().Add(budget)
 
-	for _, commentID := range ids {
-		if time.Now().After(deadline) {
-			return comments, fmt.Errorf("more-comments: time budget exceeded (%d/%d expanded)", len(comments), len(ids))
-		}
-
-		path := fmt.Sprintf("/r/%s/comments/%s/_/%s.json?raw_json=1&depth=%d",
-			subreddit, postID, commentID, s.opts.CommentDepth)
-
-		var listings []redditListing
-		if err := s.pool.getJSON(path, &listings); err != nil {
-			consecutiveErr++
-			if consecutiveErr >= 3 {
-				return comments, fmt.Errorf("more-comments: %d consecutive errors", consecutiveErr)
-			}
-			continue
-		}
-		consecutiveErr = 0
-		if len(listings) >= 2 {
-			for _, child := range listings[1].Data.Children {
-				if child.Kind == "t1" {
-					c, _ := parseComment(child.Data)
-					comments = append(comments, c)
-				}
-			}
-		}
+	workers := s.pool.size()
+	if workers > moreCommentsMaxWorkers {
+		workers = moreCommentsMaxWorkers
+	}
+	if workers > len(ids) {
+		workers = len(ids)
+	}
+	if workers < 1 {
+		workers = 1
 	}
 
+	jobs := make(chan string, len(ids))
+	for _, id := range ids {
+		jobs <- id
+	}
+	close(jobs)
+
+	var (
+		mu             sync.Mutex
+		comments       []Comment
+		consecutiveErr int64
+		budgetExceeded int32
+		expanded       int64
+	)
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for commentID := range jobs {
+				if atomic.LoadInt32(&budgetExceeded) == 1 {
+					return
+				}
+				if time.Now().After(deadline) {
+					atomic.StoreInt32(&budgetExceeded, 1)
+					return
+				}
+				if atomic.LoadInt64(&consecutiveErr) >= 3 {
+					return
+				}
+
+				path := fmt.Sprintf("/r/%s/comments/%s/_/%s.json?raw_json=1&depth=%d",
+					subreddit, postID, commentID, s.opts.CommentDepth)
+
+				var listings []redditListing
+				if err := s.pool.getJSON(path, &listings); err != nil {
+					atomic.AddInt64(&consecutiveErr, 1)
+					continue
+				}
+				atomic.StoreInt64(&consecutiveErr, 0)
+				atomic.AddInt64(&expanded, 1)
+
+				if len(listings) < 2 {
+					continue
+				}
+				batch := make([]Comment, 0, len(listings[1].Data.Children))
+				for _, child := range listings[1].Data.Children {
+					if child.Kind == "t1" {
+						c, _ := parseComment(child.Data)
+						batch = append(batch, c)
+					}
+				}
+				if len(batch) > 0 {
+					mu.Lock()
+					comments = append(comments, batch...)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if atomic.LoadInt32(&budgetExceeded) == 1 {
+		return comments, fmt.Errorf("more-comments: time budget exceeded (%d/%d expanded)", atomic.LoadInt64(&expanded), len(ids))
+	}
+	if errs := atomic.LoadInt64(&consecutiveErr); errs >= 3 {
+		return comments, fmt.Errorf("more-comments: %d consecutive errors", errs)
+	}
 	return comments, nil
 }
