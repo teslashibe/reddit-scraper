@@ -74,6 +74,51 @@ type webshareListResponse struct {
 	} `json:"results"`
 }
 
+// WebshareResidentialConfig configures residential proxy generation.
+type WebshareResidentialConfig struct {
+	// Username is the base Webshare username (e.g. "qvxmslta").
+	Username string
+	// Password is the Webshare proxy password.
+	Password string
+	// Gateway is the residential proxy gateway host:port.
+	// Defaults to "p.webshare.io:80".
+	Gateway string
+	// Country is the 2-letter country code for geo-targeting.
+	// Defaults to "US".
+	Country string
+	// Sessions is the number of distinct sticky sessions (each
+	// gets a unique residential IP). Defaults to 100.
+	Sessions int
+}
+
+// WebshareResidentialProxies generates N residential proxy URLs using
+// the Webshare gateway format. Each session number maps to a distinct
+// sticky residential IP from the 80M+ pool. No API call needed —
+// sessions are allocated on first use by the gateway.
+//
+// URL format: http://{username}residential-{country}-{session}:{password}@{gateway}/
+func WebshareResidentialProxies(cfg WebshareResidentialConfig) []string {
+	gateway := cfg.Gateway
+	if gateway == "" {
+		gateway = "p.webshare.io:80"
+	}
+	country := cfg.Country
+	if country == "" {
+		country = "US"
+	}
+	sessions := cfg.Sessions
+	if sessions <= 0 {
+		sessions = 100
+	}
+
+	urls := make([]string, 0, sessions)
+	for i := 1; i <= sessions; i++ {
+		user := fmt.Sprintf("%sresidential-%s-%d", cfg.Username, country, i)
+		urls = append(urls, fmt.Sprintf("http://%s:%s@%s", user, cfg.Password, gateway))
+	}
+	return urls
+}
+
 // WebshareProxies fetches the current proxy list from the Webshare
 // API and returns it in the URL form expected by Options.ProxyURLs.
 //
